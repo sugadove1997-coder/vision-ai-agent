@@ -4,5 +4,10 @@ dist/
 coverage/
 .DS_Store
 *.log
+.tmp_img2img_test.png
 .env*
 !.env.example
+agent/.venv/
+# 本地 Diffusers 默认 Hugging Face 缓存（避免 ~/.cache 无写权限）
+agent/.hf_hub_cache/
+agent/logs/
