@@ -42,7 +42,7 @@ function stripDataUrlPrefix(b64OrDataUrl: string) {
   return b64OrDataUrl.replace(/^data:image\/\w+;base64,/, '');
 }
 
-/** 缩小底图，减轻 HF 图生图请求体与代理超时（长截图尤其明显） */
+/** 缩小底图，减轻 /api/image/refine 请求体与超时（长截图尤其明显） */
 function downscaleDataUrlForRefine(dataUrl: string, maxEdge = 896): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -176,7 +176,6 @@ export default function App() {
       body: JSON.stringify({
         prompt,
         imageBase64: stripDataUrlPrefix(scaled),
-        strength: 0.62,
         width: 1024,
         height: 576,
       }),

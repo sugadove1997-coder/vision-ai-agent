@@ -11,7 +11,6 @@ export default defineConfig(({mode}) => {
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
       'process.env.HUGGINGFACE_TOKEN': JSON.stringify(hfToken),
-      'process.env.HF_USE_PROXY': JSON.stringify(!!hfToken),
     },
     resolve: {
       alias: {

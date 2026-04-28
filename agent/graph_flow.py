@@ -65,6 +65,15 @@ def _latest_user_text(state: AgentState) -> str:
     return ""
 
 
+def _default_general_chat_reply() -> str:
+    """general_chat 且模型未产出合法 JSON 时的固定介绍（避免误用生图兜底文案）。"""
+    return (
+        "你好，我是**多模态创意设计协作助手**。我可以陪你用中文聊需求，并在你描述清楚后，"
+        "通过 **文生图** 生成初稿，或在已有画布图像上做 **图生图** 迭代。"
+        "你现在可以直接说想做什么画面，或先上传一张参考图。"
+    )
+
+
 def _wants_new_image(text: str) -> bool:
     """用户是否在要「新画一张」—— 避免被误判成 general_chat"""
     t = text.lower()
@@ -87,6 +96,39 @@ def _wants_new_image(text: str) -> bool:
     return any(k in text for k in keys) or "draw" in t or "generate an image" in t
 
 
+def _agent_sd_prompt_mode() -> str:
+    """plan=沿用 SD 工程师 JSON 里的 sd_prompt；translate_en=仅用用户本轮话经 LLM 译成英文。"""
+    return os.getenv("AGENT_SD_PROMPT_MODE", "plan").strip().lower()
+
+
+def _user_to_english_sd_prompt(last_user: str) -> str:
+    """
+    用户原话 → 英文译文，供扩散模型使用。
+    与意图/规划共用同一套 `build_llm()`（无单独「轻量模型」）：即 AGENT_LLM_PROVIDER + LLM_MODEL / OLLAMA_MODEL / Gemini 等。
+    """
+    lu = (last_user or "").strip()[:1200]
+    if not lu:
+        return ""
+    llm = build_llm()
+    sys = """你是英译助手。用户这句话将用作 Stable Diffusion 文生图或图生图的文本描述（可能为中文或中英混合）。
+任务：把它翻译成自然、准确的英文，尽量保留原话里的颜色、主体与修改要求；不要解释、不要改写成标签列表、不要 markdown、不要代码围栏。
+
+只输出一个 JSON 对象：
+{"sd_prompt":"仅此处写英文译文"}"""
+    raw = llm.invoke(
+        [SystemMessage(content=sys), HumanMessage(content=lu)]
+    ).content
+    if not isinstance(raw, str):
+        raw = str(raw)
+    try:
+        data = _extract_json(raw)
+        out = str(data.get("sd_prompt", "")).strip()
+    except Exception:
+        out = raw.strip()
+    out = re.sub(r"^```(?:json)?\s*|\s*```$", "", out, flags=re.IGNORECASE).strip()
+    return out.strip('"\'')
+
+
 def _sd_prompt_sanitize_for_user(last_user: str, sd_prompt: str) -> str:
     """减弱历史污染：本轮明确要蓝色时，去掉明显矛盾的绿色/改色碎片（勿全局替换英文 green，避免茎叶描述被误伤）"""
     lu = last_user
@@ -102,17 +144,6 @@ def _fallback_sd_prompt_refine(last_user: str) -> str:
     """iterative_refine 时 LLM 给了 none 或 sd_prompt 被清空时的英文兜底"""
     lu = last_user
     parts: list[str] = []
-    if "背景" in lu or "底" in lu or "background" in lu.lower():
-        if "绿" in lu or "green" in lu.lower():
-            parts.append("change background to green, green backdrop, keep main subject unchanged")
-        elif "蓝" in lu or "blue" in lu.lower():
-            parts.append("change background to blue, blue backdrop, keep main subject unchanged")
-        elif "红" in lu or "red" in lu.lower():
-            parts.append("change background to red, red backdrop, keep main subject unchanged")
-        elif "黑" in lu or "dark" in lu.lower():
-            parts.append("dark background, keep main subject")
-        elif "白" in lu or "white" in lu.lower():
-            parts.append("white or light background, keep main subject")
     if "调" in lu or "色" in lu or "更亮" in lu or "更暗" in lu or "对比" in lu:
         parts.append("adjust colors and lighting as described, preserve composition")
     if not parts:
@@ -331,10 +362,42 @@ def node_clarify(state: AgentState) -> AgentState:
 
 def node_plan(state: AgentState) -> AgentState:
     trace = list(state.get("trace") or [])
-    llm = build_llm()
     intent = state.get("intent", "general_chat")
     has_img = bool(state.get("has_canvas_image"))
     last_user = _latest_user_text(state)
+
+    # 闲聊不与「SD 提示词工程师」共用同一套提示，否则小模型易返回非 JSON，误触发生图兜底话术
+    if intent == "general_chat":
+        llm = build_llm()
+        sys_chat = """你是「多模态创意设计协作助手」。
+用自然、简洁的中文回复用户（1～5 句）。可说明：支持用自然语言描述海报/插画/场景需求、文生图、在已有画面上本地图生图迭代。
+若用户打招呼、问你是谁、能做什么，礼貌回答并点出上述能力。
+**只输出一个 JSON 对象**，不要 markdown 代码围栏，不要其它说明：
+{"assistant_message": "给用户的中文回复全文"}"""
+        msgs = [SystemMessage(content=sys_chat)] + _msgs_to_lc(state["messages"])
+        raw = llm.invoke(msgs).content
+        if not isinstance(raw, str):
+            raw = str(raw)
+        assistant_message = ""
+        try:
+            data = _extract_json(raw)
+            assistant_message = str(data.get("assistant_message", "")).strip()
+        except Exception:
+            assistant_message = _default_general_chat_reply()
+        assistant_message = re.sub(
+            r"^给用户的中文回复[：:]\s*", "", assistant_message, flags=re.IGNORECASE
+        ).strip()
+        if not assistant_message:
+            assistant_message = _default_general_chat_reply()
+        trace.append("plan:chat")
+        return {
+            "assistant_message": assistant_message,
+            "sd_prompt": "",
+            "action": "chat",
+            "trace": trace,
+        }
+
+    llm = build_llm()
     sys = f"""你是 Stable Diffusion / SDXL 提示词工程师。
 
 **本轮最高优先级**——用户刚刚这句话（可能含颜色、数量、风格）：
@@ -344,7 +407,7 @@ def node_plan(state: AgentState) -> AgentState:
 
 **sd_prompt 硬性规则**：
 1) **整段只用英文**，逗号分隔标签；**禁止**在 sd_prompt 里写中文。
-2) **必须**把本轮要画的主体译成英文关键词（如 tomato / blue tomato / cyberpunk city）；**颜色必须与本轮一致**（要蓝色就写 blue / cyan，不要默认红色）。
+2) **必须**把本轮要画的主体译成英文关键词（如 tomato / cyberpunk city）；**颜色必须与本轮一致**（要蓝色就写 blue / cyan，不要默认红色）。
 3) creative_new 时：**禁止**把历史对话里旧的「改绿色、原图颜色改变」等迭代指令抄进 sd_prompt，除非**本轮用户原话**里再次出现这些词。
 4) 禁止只输出空洞的 "detailed illustration, 8k" 而没有具体主体。
 
@@ -357,7 +420,7 @@ def node_plan(state: AgentState) -> AgentState:
 
 规则：
 - creative_new -> action 必须为 generate，sd_prompt 写完整画面英文描述
-- iterative_refine 且 has_canvas_image=true -> **action 必须是 refine**，禁止 none、禁止 chat；sd_prompt 写要改的英文（如 green background）
+- iterative_refine 且 has_canvas_image=true -> **action 必须是 refine**，禁止 none、禁止 chat；sd_prompt 写本轮修改意图的英文关键词
 - general_chat -> action=chat，sd_prompt 为空字符串
 """
     msgs = [SystemMessage(content=sys)] + _msgs_to_lc(state["messages"])
@@ -368,16 +431,28 @@ def node_plan(state: AgentState) -> AgentState:
         data = _extract_json(raw)
     except Exception:
         data = {
-            "assistant_message": "好的，已根据你这句话整理英文生图提示并准备生成。",
+            "assistant_message": (
+                _default_general_chat_reply()
+                if intent == "general_chat"
+                else "好的，已根据你这句话整理英文生图提示并准备生成。"
+            ),
             "sd_prompt": (
-                _fallback_sd_prompt_creative(last_user)
-                if intent == "creative_new"
-                else _fallback_sd_prompt_refine(last_user)
+                ""
+                if intent == "general_chat"
+                else (
+                    _fallback_sd_prompt_creative(last_user)
+                    if intent == "creative_new"
+                    else _fallback_sd_prompt_refine(last_user)
+                )
             ),
             "action": (
-                "generate"
-                if intent == "creative_new"
-                else ("refine" if intent == "iterative_refine" and has_img else "none")
+                "chat"
+                if intent == "general_chat"
+                else (
+                    "generate"
+                    if intent == "creative_new"
+                    else ("refine" if intent == "iterative_refine" and has_img else "none")
+                )
             ),
         }
     action = str(data.get("action", "none"))
@@ -389,35 +464,50 @@ def node_plan(state: AgentState) -> AgentState:
     # 迭代 + 已有画布：必须出 refine，否则前端 action=none 不会调 /api/image/refine
     if intent == "iterative_refine" and has_img and action in ("generate", "none", "chat"):
         action = "refine"
-    sd_prompt = str(data.get("sd_prompt", "")).strip()
-    # 去掉模型误写入的中文，避免 SD / HF 指令混乱
-    if action in ("generate", "refine"):
-        sd_prompt = re.sub(r"[\u4e00-\u9fff]+", " ", sd_prompt)
-        sd_prompt = re.sub(r"\s+", " ", sd_prompt).strip(" ,.")
-    sd_prompt = _sd_prompt_sanitize_for_user(last_user, sd_prompt)
-    # 解析成功但小模型仍可能泛泛而谈：用英文兜底补强（不再拼中文进 sd_prompt）
-    generic = len(sd_prompt) < 28 or sd_prompt.lower() in (
-        "high quality detailed artwork, professional composition",
-        "high quality, professional composition",
-    )
-    if last_user and action in ("generate", "refine") and generic:
-        fb = (
-            _fallback_sd_prompt_creative(last_user)
-            if action == "generate"
-            else _fallback_sd_prompt_refine(last_user)
+
+    mode = _agent_sd_prompt_mode()
+    if mode == "translate_en" and action in ("generate", "refine") and last_user.strip():
+        sd_prompt = _user_to_english_sd_prompt(last_user)
+        trace.append("plan:sd_translate_en")
+        if action in ("generate", "refine"):
+            sd_prompt = re.sub(r"[\u4e00-\u9fff]+", " ", sd_prompt)
+            sd_prompt = re.sub(r"\s+", " ", sd_prompt).strip(" ,.")
+        sd_prompt = _sd_prompt_sanitize_for_user(last_user, sd_prompt)
+        if not sd_prompt.strip():
+            sd_prompt = (
+                _fallback_sd_prompt_creative(last_user)
+                if action == "generate"
+                else _fallback_sd_prompt_refine(last_user)
+            )
+    else:
+        sd_prompt = str(data.get("sd_prompt", "")).strip()
+        # 去掉模型误写入的中文，避免 SD / HF 指令混乱
+        if action in ("generate", "refine"):
+            sd_prompt = re.sub(r"[\u4e00-\u9fff]+", " ", sd_prompt)
+            sd_prompt = re.sub(r"\s+", " ", sd_prompt).strip(" ,.")
+        sd_prompt = _sd_prompt_sanitize_for_user(last_user, sd_prompt)
+        # 解析成功但小模型仍可能泛泛而谈：用英文兜底补强（不再拼中文进 sd_prompt）
+        generic = len(sd_prompt) < 28 or sd_prompt.lower() in (
+            "high quality detailed artwork, professional composition",
+            "high quality, professional composition",
         )
-        sd_prompt = f"{fb}, {sd_prompt}".strip(", ")
-    elif last_user and action in ("generate", "refine"):
-        # 确保颜色/主体线索在英文里（简单关键词注入）
-        boost = []
-        if "蓝" in last_user or "blue" in last_user.lower():
-            boost.append("blue color theme as requested")
-        if "红" in last_user or "red" in last_user.lower():
-            boost.append("red color theme as requested")
-        if "绿" in last_user:
-            boost.append("green color theme as requested")
-        if boost and not any(b.split()[0] in sd_prompt.lower() for b in boost):
-            sd_prompt = f"{sd_prompt}, {', '.join(boost)}".strip(", ")
+        if last_user and action in ("generate", "refine") and generic:
+            fb = (
+                _fallback_sd_prompt_creative(last_user)
+                if action == "generate"
+                else _fallback_sd_prompt_refine(last_user)
+            )
+            sd_prompt = f"{fb}, {sd_prompt}".strip(", ")
+        elif last_user and action == "generate":
+            boost = []
+            if "蓝" in last_user or "blue" in last_user.lower():
+                boost.append("blue color theme as requested")
+            if "红" in last_user or "red" in last_user.lower():
+                boost.append("red color theme as requested")
+            if "绿" in last_user:
+                boost.append("green color theme as requested")
+            if boost and not any(b.split()[0] in sd_prompt.lower() for b in boost):
+                sd_prompt = f"{sd_prompt}, {', '.join(boost)}".strip(", ")
 
     assistant_message = str(data.get("assistant_message", "")).strip()
     # 去掉小模型泄漏的模板前缀

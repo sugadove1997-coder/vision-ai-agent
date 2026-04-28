@@ -9,6 +9,9 @@
 
 环境变量：
   LOCAL_IMG2IMG_MODEL  默认 runwayml/stable-diffusion-v1-5（显存/内存友好）
+  LOCAL_IMG2IMG_DEVICE  可选 cpu | mps | cuda；未设时 Apple/有 MPS 则优先 MPS
+  LOCAL_IMG2IMG_MPS_FP16  仅在 MPS 上：设为 1 用 fp16 加速（可能黑图）；默认 MPS 用整网 fp32
+  LOCAL_IMG2IMG_VAE_FP32  MPS+fp16 时默认开：仅 VAE fp32；整网 fp32 时可关
 """
 from __future__ import annotations
 
@@ -74,6 +77,10 @@ def _progress_bar(done: int, total: int, width: int = 22) -> str:
 def _pick_device() -> str:
     import torch
 
+    override = os.getenv("LOCAL_IMG2IMG_DEVICE", "").strip().lower()
+    if override in ("cpu", "mps", "cuda"):
+        return override
+
     if torch.backends.mps.is_available():
         return "mps"
     if torch.cuda.is_available():
@@ -95,7 +102,18 @@ def get_pipeline():
         ) from e
 
     _DEVICE = _pick_device()
-    dtype = torch.float16 if _DEVICE in ("mps", "cuda") else torch.float32
+    mps_fp16 = os.getenv("LOCAL_IMG2IMG_MPS_FP16", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if _DEVICE == "cpu":
+        dtype = torch.float32
+    elif _DEVICE == "mps":
+        # MPS 上 fp16 UNet 仍可能产出无效潜变量；默认 fp32，仅显式 MPS_FP16=1 才用半精度
+        dtype = torch.float16 if mps_fp16 else torch.float32
+    else:
+        dtype = torch.float16 if _DEVICE == "cuda" else torch.float32
     _log(f"加载模型开始 model={_MODEL_ID} device={_DEVICE} dtype={dtype}")
     _log(
         "from_pretrained 中：首次会从 Hub 下载/校验权重，下方可能有 tqdm；"
@@ -130,6 +148,21 @@ def get_pipeline():
             _pipe.enable_attention_slicing()
         except Exception:
             pass
+        # MPS + fp16 VAE 解码易出现 NaN/Inf，diffusers 转 uint8 会报警告且画面全黑（PNG 体积极小）
+        vae_env = os.getenv("LOCAL_IMG2IMG_VAE_FP32", "").strip().lower()
+        if vae_env in ("0", "false", "no"):
+            vae_fp32 = False
+        elif vae_env in ("1", "true", "yes"):
+            vae_fp32 = True
+        else:
+            vae_fp32 = _DEVICE == "mps" and dtype == torch.float16
+        if vae_fp32:
+            _pipe.vae.to(dtype=torch.float32)
+            _log("VAE 已设为 float32（缓解 Apple MPS 黑图 / invalid value encountered in cast）")
+        try:
+            _pipe.enable_vae_slicing()
+        except Exception:
+            pass
         _log(f"加载完成，可在 {_DEVICE} 上推理（总耗时约 {time.perf_counter() - load_t0:.1f}s）")
     finally:
         _pipeline_loading = False
@@ -145,6 +178,10 @@ class Img2ImgRequest(BaseModel):
     height: Optional[int] = Field(None, ge=64, le=1024)
     num_inference_steps: int = Field(28, ge=8, le=50)
     guidance_scale: float = Field(7.5, ge=1.0, le=20.0)
+    negative_prompt: Optional[str] = Field(
+        None,
+        description="抑制重画主体时常用；空则不传",
+    )
 
 
 @app.get("/health")
@@ -215,6 +252,18 @@ def img2img(body: Img2ImgRequest):
             num_inference_steps=body.num_inference_steps,
             guidance_scale=body.guidance_scale,
         )
+        neg = (body.negative_prompt or "").strip()
+        if neg:
+            call_kw["negative_prompt"] = neg
+        # 部分 diffusers 版本支持；与 VAE fp32 一起减少 MPS 解码数值问题
+        try:
+            import inspect
+
+            sig = inspect.signature(pipe.__call__)
+            if "upcast_vae" in sig.parameters:
+                call_kw["upcast_vae"] = True
+        except Exception:
+            pass
         try:
             out = pipe(
                 **call_kw,

@@ -47,11 +47,16 @@ async function hfImageToBuffer(image: Blob | string): Promise<Buffer> {
 async function tryLocalDiffusersImg2Img(
   prompt: string,
   imageBuf: Buffer,
-  strength: number,
-  width: number,
-  height: number,
+  width: number | undefined,
+  height: number | undefined,
   signal?: AbortSignal,
-  diag?: { httpStatus?: number; body?: string; catchMessage?: string }
+  diag?: { httpStatus?: number; body?: string; catchMessage?: string },
+  extra?: {
+    strength?: number;
+    guidance_scale?: number;
+    num_inference_steps?: number;
+    negative_prompt?: string;
+  }
 ): Promise<Buffer | null> {
   const base = (process.env.LOCAL_IMG2IMG_URL || 'http://127.0.0.1:8010').replace(/\/$/, '');
   const url = `${base}/img2img`;
@@ -70,17 +75,30 @@ async function tryLocalDiffusersImg2Img(
       );
     }, waitLogMs);
     let res: Awaited<ReturnType<typeof undiciDirect>>;
+    const body: Record<string, unknown> = {
+      prompt,
+      image_base64: imageBuf.toString('base64'),
+    };
+    if (extra?.strength != null && Number.isFinite(extra.strength)) {
+      body.strength = Math.min(0.99, Math.max(0.05, extra.strength));
+    }
+    if (width != null && Number.isFinite(width)) body.width = Math.round(width);
+    if (height != null && Number.isFinite(height)) body.height = Math.round(height);
+    if (extra?.guidance_scale != null && Number.isFinite(extra.guidance_scale)) {
+      body.guidance_scale = extra.guidance_scale;
+    }
+    if (extra?.num_inference_steps != null && Number.isFinite(extra.num_inference_steps)) {
+      body.num_inference_steps = Math.round(extra.num_inference_steps);
+    }
+    if (extra?.negative_prompt != null && typeof extra.negative_prompt === 'string') {
+      const n = extra.negative_prompt.trim().slice(0, 2000);
+      if (n) body.negative_prompt = n;
+    }
     try {
       res = await undiciDirect(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          image_base64: imageBuf.toString('base64'),
-          strength,
-          width,
-          height,
-        }),
+        body: JSON.stringify(body),
         signal,
       });
     } finally {
@@ -170,9 +188,12 @@ app.post('/api/image/refine', async (req, res) => {
   const {
     prompt,
     imageBase64,
-    strength = 0.65,
-    width = 1024,
-    height = 576,
+    strength: strengthBody,
+    width: widthBody,
+    height: heightBody,
+    guidance_scale: guidanceScaleBody,
+    num_inference_steps: numInferenceStepsBody,
+    negative_prompt: negativePromptBody,
   } = req.body || {};
   if (!prompt || typeof prompt !== 'string') {
     res.status(400).json({ error: '缺少 prompt' });
@@ -190,9 +211,13 @@ app.post('/api/image/refine', async (req, res) => {
     res.status(400).json({ error: 'imageBase64 无效' });
     return;
   }
-  const s = Math.min(0.95, Math.max(0.1, Number(strength) || 0.65));
-  const w = Number(width) || 1024;
-  const h = Number(height) || 576;
+  const parseDim = (v: unknown): number | undefined => {
+    if (v === undefined || v === null || v === '') return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const w = parseDim(widthBody);
+  const h = parseDim(heightBody);
   const localImg2imgTimeoutMs = Math.min(
     1_200_000,
     Math.max(120_000, Number(process.env.LOCAL_IMG2IMG_TIMEOUT_MS) || 600_000)
@@ -202,8 +227,34 @@ app.post('/api/image/refine', async (req, res) => {
       ? AbortSignal.timeout(localImg2imgTimeoutMs)
       : undefined;
 
+  const extra: {
+    strength?: number;
+    guidance_scale?: number;
+    num_inference_steps?: number;
+    negative_prompt?: string;
+  } = {};
+  if (strengthBody !== undefined && strengthBody !== null && strengthBody !== '') {
+    const st = Number(strengthBody);
+    if (Number.isFinite(st)) extra.strength = Math.min(0.99, Math.max(0.05, st));
+  }
+  const gs = Number(guidanceScaleBody);
+  const nis = Number(numInferenceStepsBody);
+  if (Number.isFinite(gs) && gs >= 1 && gs <= 20) extra.guidance_scale = gs;
+  if (Number.isFinite(nis) && nis >= 8 && nis <= 50) extra.num_inference_steps = Math.round(nis);
+  if (typeof negativePromptBody === 'string' && negativePromptBody.trim()) {
+    extra.negative_prompt = negativePromptBody.trim().slice(0, 2000);
+  }
+
   const localDiag: { httpStatus?: number; body?: string; catchMessage?: string } = {};
-  const localOut = await tryLocalDiffusersImg2Img(prompt, buf, s, w, h, localSignal, localDiag);
+  const localOut = await tryLocalDiffusersImg2Img(
+    prompt,
+    buf,
+    w,
+    h,
+    localSignal,
+    localDiag,
+    Object.keys(extra).length ? extra : undefined
+  );
   if (localOut) {
     res.setHeader('Content-Type', 'image/png');
     res.send(localOut);
